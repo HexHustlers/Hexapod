@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18-DOF Hexapod Gait Simulator</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#111827;color:#e5e7eb;font-family:Arial,sans-serif}
+  .app{display:grid;grid-template-columns:360px 1fr;min-height:100vh}
+  .panel{padding:18px;background:#1f2937;border-right:1px solid #374151;overflow:auto}
+  h1{font-size:21px;margin:0 0 5px}.sub{font-size:12px;color:#9ca3af;margin-bottom:18px}
+  .section{border-top:1px solid #374151;padding-top:14px;margin-top:14px}
+  label{display:block;font-size:12px;color:#cbd5e1;margin:8px 0 4px}
+  select,input[type=range]{width:100%}
+  select,button{background:#111827;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px;padding:8px}
+  .row{display:flex;gap:7px;align-items:center}.row>*{flex:1}
+  .leg{border:1px solid #374151;border-radius:7px;padding:8px;margin:8px 0}
+  .leg b{font-size:12px}.val{font-size:11px;color:#9ca3af;text-align:right}
+  button{cursor:pointer}.primary{background:#2563eb;border-color:#3b82f6}
+  .stage{position:relative;display:flex;flex-direction:column;min-width:0}
+  canvas{width:100%;height:100%;min-height:650px;display:block}
+  .topbar{position:absolute;top:14px;left:14px;right:14px;display:flex;justify-content:space-between;pointer-events:none}
+  .badge{background:#1f2937dd;border:1px solid #4b5563;border-radius:7px;padding:8px 11px;font-size:12px}
+  .legend{position:absolute;bottom:14px;left:14px;background:#1f2937dd;border:1px solid #4b5563;border-radius:7px;padding:9px;font-size:11px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
+  .hint{font-size:11px;color:#9ca3af;line-height:1.45}
+  @media(max-width:850px){.app{grid-template-columns:1fr}.panel{border-right:0;border-bottom:1px solid #374151}.stage{min-height:600px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="panel">
+    <h1>18-DOF Hexapod Simulator</h1>
+    <div class="sub">6 legs × 3 joints — Coxa / Femur / Tibia</div>
+
+    <div class="section">
+      <label>Gait</label>
+      <select id="gait">
+        <option value="manual">Manual Pose</option>
+        <option value="tripod">Tripod Gait</option>
+        <option value="ripple">Ripple Gait</option>
+        <option value="wave">Wave Gait</option>
+      </select>
+
+      <label>Animation Speed</label>
+      <input id="speed" type="range" min="0.1" max="3" value="1" step="0.1">
+      <div class="val" id="speedVal">1.0×</div>
+
+      <div class="row">
+        <button class="primary" id="play">▶ Play</button>
+        <button id="reset">Reset Home</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Global gait parameters</label>
+      <label>Step Height <span class="val" id="liftVal">35°</span></label>
+      <input id="lift" type="range" min="0" max="60" value="35">
+      <label>Step Advance <span class="val" id="advanceVal">30°</span></label>
+      <input id="advance" type="range" min="0" max="60" value="30">
+    </div>
+
+    <div class="section">
+      <div class="row"><b style="font-size:13px">Individual Joint Angles</b><button id="homeSelected">Home All</button></div>
+      <div id="legs"></div>
+    </div>
+
+    <div class="section hint">
+      <b>Controls:</b><br>
+      Manual Pose: drag the 18 sliders to change each servo angle.<br>
+      Gait modes: Play/Stop the generated gait and watch the leg phases.<br>
+      The visualization is a kinematic concept model, not a physical dynamics simulator.
+    </div>
+  </aside>
+
+  <main class="stage">
+    <canvas id="canvas"></canvas>
+    <div class="topbar">
+      <div class="badge" id="status">MANUAL POSE • STOPPED</div>
+      <div class="badge" id="angles">18 servos</div>
+    </div>
+    <div class="legend">
+      <span class="dot" style="background:#ef4444"></span>Coxa
+      &nbsp; <span class="dot" style="background:#f59e0b"></span>Femur
+      &nbsp; <span class="dot" style="background:#22c55e"></span>Tibia
+      &nbsp; <span class="dot" style="background:#60a5fa"></span>Foot
+    </div>
+  </main>
+</div>
+
+<script>
+const canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
+const gaitEl=document.getElementById('gait'), playBtn=document.getElementById('play');
+const speedEl=document.getElementById('speed'), liftEl=document.getElementById('lift'), advEl=document.getElementById('advance');
+const speedVal=document.getElementById('speedVal'),liftVal=document.getElementById('liftVal'),advanceVal=document.getElementById('advanceVal');
+const legsEl=document.getElementById('legs'),statusEl=document.getElementById('status');
+
+const names=['LF','LM','LR','RF','RM','RR'];
+const sides=[-1,-1,-1,1,1,1];
+const phases={LF:0,RM:0,LR:0,RF:Math.PI,LM:Math.PI,RR:Math.PI};
+const joints=Array.from({length:6},()=>({c:90,f:90,t:90}));
+let playing=false, time=0, last=performance.now();
+
+function makeControls(){
+  names.forEach((n,i)=>{
+    const box=document.createElement('div'); box.className='leg';
+    box.innerHTML=`<b>${n}</b><div id="controls${i}"></div>`;
+    legsEl.appendChild(box);
+    [['c','Coxa'],['f','Femur'],['t','Tibia']].forEach(([key,label])=>{
+      const row=document.createElement('div');
+      row.innerHTML=`<label>${label}<span class="val" id="v${i}${key}">90°</span></label>
+      <input type="range" min="20" max="160" value="90" id="s${i}${key}">`;
+      box.appendChild(row);
+      row.querySelector('input').oninput=e=>{
+        joints[i][key]=+e.target.value;
+        document.getElementById(`v${i}${key}`).textContent=e.target.value+'°';
+        if(gaitEl.value!=='manual') gaitEl.value='manual';
+      };
+    });
+  });
+}
+makeControls();
+
+document.getElementById('homeSelected').onclick=resetHome;
+document.getElementById('reset').onclick=resetHome;
+function resetHome(){
+  joints.forEach((j,i)=>{j.c=90;j.f=90;j.t=90;['c','f','t'].forEach(k=>{
+    const s=document.getElementById(`s${i}${k}`);s.value=90;document.getElementById(`v${i}${k}`).textContent='90°';
+  })});
+  time=0; draw();
+}
+playBtn.onclick=()=>{playing=!playing;playBtn.textContent=playing?'⏸ Pause':'▶ Play';};
+
+[speedEl,liftEl,advEl].forEach(e=>e.oninput=()=>{
+  speedVal.textContent=speedEl.value+'×';
+  liftVal.textContent=liftEl.value+'°';
+  advanceVal.textContent=advEl.value+'°';
+});
+
+function gaitAngles(i,t){
+  const mode=gaitEl.value, n=names[i];
+  if(mode==='manual') return joints[i];
+  let phase=0;
+  if(mode==='tripod') phase=phases[n];
+  if(mode==='ripple') phase=i*Math.PI/3;
+  if(mode==='wave') phase=i*2*Math.PI/6;
+  const p=(t*speedEl.value*0.9+phase)%(Math.PI*2);
+  const swing=Math.max(0,Math.sin(p));
+  const push=-Math.max(0,Math.sin(p+Math.PI/2))*0.35;
+  return {
+    c:90 + Math.sin(p)*(+advEl.value),
+    f:90 - swing*(+liftEl.value)*0.65 + push*12,
+    t:90 + swing*(+liftEl.value)*0.95 - push*16
+  };
+}
+
+function resize(){
+  const r=canvas.getBoundingClientRect(), d=devicePixelRatio||1;
+  canvas.width=r.width*d;canvas.height=r.height*d;ctx.setTransform(d,0,0,d,0,0);
+}
+window.onresize=resize;resize();
+
+function drawLeg(i,cx,cy,scale){
+  const a=gaitAngles(i,time);
+  const side=sides[i], row=Math.floor(i%3), forward=[-1,0,1][row];
+  const baseAngle=(side<0?Math.PI:0);
+  const coxa=(a.c-90)*Math.PI/180;
+  const fem=(a.f-90)*Math.PI/180;
+  const tib=(a.t-90)*Math.PI/180;
+
+  const coxaLen=38*scale, femLen=72*scale, tibLen=72*scale;
+  const hipAng=baseAngle+coxa;
+  const kx=cx+Math.cos(hipAng)*coxaLen, ky=cy+Math.sin(hipAng)*coxaLen;
+  const kneeAng=baseAngle + side*(0.65 + fem*0.75);
+  const tx=kx+Math.cos(kneeAng)*femLen, ty=ky+Math.sin(kneeAng)*femLen;
+  const footAng=kneeAng + side*(1.15 + tib*0.75);
+  const fx=tx+Math.cos(footAng)*tibLen, fy=ty+Math.sin(footAng)*tibLen;
+
+  ctx.lineCap='round';
+  ctx.lineWidth=10*scale;ctx.strokeStyle='#ef4444';ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(kx,ky);ctx.stroke();
+  ctx.lineWidth=12*scale;ctx.strokeStyle='#f59e0b';ctx.beginPath();ctx.moveTo(kx,ky);ctx.lineTo(tx,ty);ctx.stroke();
+  ctx.lineWidth=10*scale;ctx.strokeStyle='#22c55e';ctx.beginPath();ctx.moveTo(tx,ty);ctx.lineTo(fx,fy);ctx.stroke();
+
+  [[cx,cy,'#ef4444'],[kx,ky,'#f59e0b'],[tx,ty,'#22c55e'],[fx,fy,'#60a5fa']].forEach(q=>{
+    ctx.fillStyle=q[2];ctx.beginPath();ctx.arc(q[0],q[1],6*scale,0,Math.PI*2);ctx.fill();
+  });
+
+  ctx.fillStyle='#d1d5db';ctx.font=`${11*scale}px Arial`;ctx.fillText(names[i],fx+6,fy-6);
+}
+
+function draw(){
+  const w=canvas.clientWidth,h=canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='#0b1220';ctx.fillRect(0,0,w,h);
+
+  // grid
+  ctx.strokeStyle='#172033';ctx.lineWidth=1;
+  for(let x=0;x<w;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
+  for(let y=0;y<h;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+
+  const cx=w/2,cy=h/2, bodyW=Math.min(240,w*0.3),bodyH=150;
+  ctx.fillStyle='#374151';ctx.strokeStyle='#9ca3af';ctx.lineWidth=2;
+  ctx.beginPath();ctx.roundRect(cx-bodyW/2,cy-bodyH/2,bodyW,bodyH,18);ctx.fill();ctx.stroke();
+
+  // six leg attachment points
+  const pts=[
+    [cx-bodyW/2,cy-bodyH/2+20],[cx-bodyW/2,cy],[cx-bodyW/2,cy+bodyH/2-20],
+    [cx+bodyW/2,cy-bodyH/2+20],[cx+bodyW/2,cy],[cx+bodyW/2,cy+bodyH/2-20]
+  ];
+  pts.forEach((p,i)=>drawLeg(i,p[0],p[1],Math.min(1,w/1000)));
+  ctx.fillStyle='#e5e7eb';ctx.font='bold 14px Arial';ctx.textAlign='center';ctx.fillText('18-DOF HEXAPOD',cx,cy+5);
+  ctx.textAlign='left';
+
+  const mode=gaitEl.value.toUpperCase();
+  statusEl.textContent=`${mode} • ${playing?'RUNNING':'STOPPED'}`;
+  document.getElementById('angles').textContent=names.map((n,i)=>{
+    const a=gaitAngles(i,time);return `${n} ${Math.round(a.c)}/${Math.round(a.f)}/${Math.round(a.t)}°`;
+  }).join('   ');
+}
+
+function animate(now){
+  if(playing) time+=(now-last)/1000;
+  last=now;draw();requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
